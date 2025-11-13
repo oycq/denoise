@@ -12,12 +12,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+import torch.cuda.amp as amp  # AMP 支持
 import cv2
 import numpy as np
 import wandb
 
 # ==================== 2. wandb 初始化（简化） ====================
-wandb.init(project="raw-denoise", name="unet_noise_K4_noBN")
+wandb.init(project="raw-denoise", name="unet_noise_K4_noBN_fp16")
 
 # ==================== 3. 数据集 ====================
 def add_raw_noise(img, k=1.0, black_level=9.25 / 255.0):
@@ -96,9 +97,9 @@ class UNet(nn.Module):
         u1 = self.up1(u2); u1 = torch.cat([u1, d1], dim=1); u1 = self.conv1(u1)
         return self.final(u1)
 
-# ==================== 5. 保存图像函数（每10秒一次） ====================
+# ==================== 5. 保存图像函数（每30秒一次） ====================
 last_save_time = 0.0
-SAVE_INTERVAL = 10.0
+SAVE_INTERVAL = 30
 os.makedirs("debug", exist_ok=True)  # 创建 debug 文件夹
 
 def save_images(epoch, batch_idx, noisy_img, denoised_img, clean_img):
@@ -135,8 +136,9 @@ def save_images(epoch, batch_idx, noisy_img, denoised_img, clean_img):
     print(f"Saved debug images for epoch {epoch}, batch {batch_idx+1}")
     return False  # 无需中断
 
-# ==================== 6. 训练循环（wandb log） ====================
+# ==================== 6. 训练循环（wandb log + AMP） ====================
 def train_model(model, loader, criterion, optimizer, epochs, device='cuda'):
+    scaler = amp.GradScaler()  # AMP 梯度缩放器
     model.to(device)
     model.train()
     global_step = 0
@@ -147,12 +149,16 @@ def train_model(model, loader, criterion, optimizer, epochs, device='cuda'):
             noisy, clean = noisy.to(device), clean.to(device)
             optimizer.zero_grad()
 
-            pred_noise = model(noisy)
-            denoised = noisy - pred_noise
-            loss = criterion(denoised, clean)
+            # AMP: 自动混合精度
+            with amp.autocast():
+                pred_noise = model(noisy)
+                denoised = noisy - pred_noise
+                loss = criterion(denoised, clean)
 
-            loss.backward()
-            optimizer.step()
+            # 反向传播 + 梯度缩放
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             batch_loss = loss.item()
             epoch_loss += batch_loss
@@ -167,7 +173,7 @@ def train_model(model, loader, criterion, optimizer, epochs, device='cuda'):
             print(f"Epoch [{epoch}/{epochs}], Batch [{batch_idx+1}/{len(loader)}], "
                   f"Loss: {batch_loss:.6f}")
 
-            # 每10秒保存一次图像
+            # 每30秒保存一次图像
             with torch.no_grad():
                 n_img = noisy[0].cpu().numpy().squeeze() * 4
                 d_img = denoised[0].cpu().numpy().squeeze() * 4
@@ -187,11 +193,18 @@ def train_model(model, loader, criterion, optimizer, epochs, device='cuda'):
 # ==================== 7. 主程序 ====================
 if __name__ == "__main__":
     data_dir = "data"
-    batch_size = 16  # 改为16
+    batch_size = 16
     num_epochs = 20
 
     dataset = DenoisingDataset(data_dir, k_range=(0.025, 0.1))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=15,  # 使用15个CPU核心加载数据
+        pin_memory=True,  # 固定内存优化CPU→GPU传输
+        persistent_workers=True  # 保持worker进程
+    )
 
     model = UNet(in_channels=1, out_channels=1, K=4)
     criterion = nn.MSELoss()
